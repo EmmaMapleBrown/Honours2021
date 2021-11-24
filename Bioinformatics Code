@@ -1,0 +1,214 @@
+library(readxl)
+library(limma)
+library(edgeR)
+library(org.Hs.eg.db)
+library(dplyr)
+library(clusterProfiler)
+library(ggplot2)
+library(ggrepel)
+library(tidyverse)
+library(tm)
+library(plotly)
+library(ggpubr)
+library(ggfortify)
+library(eulerr)
+library(distances)
+library(ggdendro)
+library(RColorBrewer)
+library(enrichplot)
+library(rvcheck)
+library(ggnewscale)
+library(ReactomePA)
+
+#import 
+Samples <- read_excel("Samples.xlsx")
+View(Samples)    
+Samples <- as.data.frame(Samples)
+
+Genes <- read_csv("Gene_annotations.csv")
+Genes <- as.data.frame(Genes)
+
+Counts <- read_excel("Emma_Counts.xlsx")
+Counts <- as.data.frame(Counts)
+
+# this fixes the second
+Counts <- Counts[!duplicated(Counts$...1), ]
+
+# try again to change type
+rownames(Counts) <- Counts$...1
+
+#get rid of the first column, as now its in the row names
+Counts <- Counts[-1]
+
+# getting rid of stuff in Genes that isn't in Counts 
+Genes <- Genes[!duplicated(Genes$ENSEMBL), ]
+
+Counts <- as.matrix(Counts)
+
+# genes with no count 
+table(rowSums(Counts==0)==35)
+
+# make a counts per million object
+mycpm <- cpm(Counts)
+
+# safety copy 
+copyCounts = Counts
+
+# making DGE list 
+d = DGEList(counts = Counts, group = Samples$Condition, samples=Samples, genes = Genes)
+
+# filter by expression 
+keep.exprs <- filterByExpr(d, group="NDD")
+d <- d[keep.exprs,, keep.lib.sizes=FALSE]
+dim(d)
+
+# normalisation 
+d <- calcNormFactors(d)
+
+# boxplot of the logCPMs
+logcpm <- cpm(d, log=TRUE)
+
+# making a matrix of the genes and then creating columns for each value (ie sample info)
+thematrix <- logcpm %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  gather(Sample, log2cpm, -rowname)
+
+# merge the new matrix with the samples info - pre normalisation 
+mdata <- merge(thematrix, Samples, by = c("Sample"))
+newdata <- mdata
+
+after <- ggplot(mdata, aes(x = Sample, y = log2cpm, fill = Condition)) +   geom_boxplot(outlier.fill = "green") +
+  stat_summary(fun="mean", color="white") +   theme(text = element_text(size=15),axis.text.x = element_text(angle=90, hjust=1)) + 
+  geom_hline(yintercept=median(newdata$log2cpm),color = "red") +  scale_fill_manual(values=c("lightpink3","lightseagreen"))
+
+
+# unfiltered
+unfiltered <- DGEList(counts = Counts, group = Samples$Condition, samples=Samples, genes= Genes)
+unfilteredlogcpm <- cpm(unfiltered, log=TRUE)
+
+# making a matrix of the genes and then creating columns for each value (ie sample info)
+unfilteredthematrix <- unfilteredlogcpm %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  gather(Sample, log2cpm, -rowname)
+
+# merge the new matrix with the samples info - post normalisation 
+unfiltereddata <- merge(unfilteredthematrix, Samples, by = c("Sample"))
+
+before<- ggplot(unfiltereddata, aes(x = Sample, y = log2cpm, fill = Condition)) +   geom_boxplot(outlier.fill = "green") +
+  stat_summary(fun="mean", color="white") +   theme(text = element_text(size=15),axis.text.x = element_text(angle=90, hjust=1)) + 
+  geom_hline(yintercept=median(unfiltereddata$log2cpm),color = "red") +  scale_fill_manual(values=c("lightpink3","lightseagreen"))
+
+ggarrange(before,after, labels = c("A","B"), ncol = 2)
+
+
+### initial data analysis ###
+# hierarchical clustering dendrogram 
+dist_clustering = dist(t(d$counts), method = "euclidean")
+
+cCountcluster = hclust(dist_clustering)
+
+ggdendrogram(cCountcluster) 
+
+# MDS 
+distEuc <- dist(t(scale(d$counts)))
+newmds <- cmdscale(distEuc)
+colnames(newmds) <- c("Dimension1","Dimension2")
+
+ggplot(newmds,aes(x=Dimension1,y=Dimension2, add = "reg.line",conf.int = TRUE, colour = Samples$Condition)) +
+  geom_point(size=3) + scale_color_manual(values=c("lightpink3","lightseagreen")) +
+  ggtitle("Multidimensional Scaling Plot") + theme(plot.title = element_text(hjust=0.5,face="bold")) +
+  labs(colour="Condition")
+
+# PCA plot 
+pca = prcomp(t(logcpm))
+pcaplot <- autoplot(pca, data = Samples ,colour ="Condition", size = 3) + 
+  scale_color_manual(values=c("lightpink3","lightseagreen")) + ggtitle("Principal Component Analysis") + 
+  theme(plot.title = element_text(hjust=0.5,face="bold"))
+pcaplot
+
+# scree plot
+varExp = (100)
+varExp = (100*pca$sdev^2)/sum(pca$sdev^2)
+varDF = data.frame(Dimensions=1:length(varExp),
+                   varExp=varExp)
+
+
+hist <- ggplot(varDF,aes(x=Dimensions,y=varExp)) +
+  geom_col(fill = "lightseagreen") +
+  theme_gray() + ylim(c(0,30)) + ylab("% variance explained")
+hist <- hist + theme(plot.title = element_text(hjust=0.5,face="bold")) + ggtitle("Variance Histogram")
+
+# combine PCA and scree plot
+ggarrange(hist, pcaplot + rremove("x.text"),
+          labels = c("A", "B"),
+          ncol = 2)
+
+### DEG ###
+# cond
+cond=paste0(d$samples$group)
+design=model.matrix(~0 + cond)
+y<-estimateDisp(d,design)
+fit <- glmQLFit(y, design)
+
+# contrast matrix
+cmatrix <-makeContrasts(condNDD-condNC, levels=design)
+
+# comparing everything
+qlf<-glmQLFTest(fit, contrast = cmatrix)
+results <- topTags(qlf, n=1000)
+
+# getting direction for the DEGs
+mygenes <- as.data.frame(results)
+mygenes$direction=ifelse(mygenes$logFC>0,"up","down")
+
+# universe
+tt <-data.frame(topTags(qlf,n=2000000))
+tt$direction=ifelse(tt$logFC>0,"up","down")
+
+# volcano plot
+ggplot(tt,aes(x=logFC,y=-log10(FDR), colour=direction)) + geom_point(size=0.5) + scale_colour_manual(values = c("#2980b9","#c0392b"))  +
+  geom_text_repel(data=head(tt,20),aes(label=SYMBOL)) + ## symbol needs to be added to gene object
+  geom_hline(yintercept = 1, linetype="longdash",colour="#A9A9A9", size=0.5) +
+  geom_vline(xintercept = 1, linetype="longdash",colour="#A9A9A9", size=0.5) +
+  geom_vline(xintercept = -1, linetype="longdash",colour="#A9A9A9", size=0.5) +
+  theme(legend.position="bottom",legend.title =  element_text(face="bold")) +  xlim(-5, 6) + ylim(0,2)
+
+# heatmap
+fcs <- logcpm[rownames(mygenes),]
+heatmapinfo <- d$samples 
+heatmapinfo <- heatmapinfo[order(heatmapinfo$group),]
+
+names(heatmapinfo)[1] <- "Group"
+
+pheatmap::pheatmap(fcs[c(1:1000),], annotation_col = heatmapinfo[1],scale="row", cluster_cols = FALSE, show_rownames=F,
+                   gaps_col= c(20), color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100))
+
+### pathway analysis ###
+# create an object that contains the genes and their fold changes
+foldchanges <- c(tt$ENTREZID, tt$logFC)
+gl <- tt[,"logFC"]
+names(gl) <- as.data.frame(tt[,"ENTREZID"])
+
+
+# GO 
+my_GO<-compareCluster(ENTREZID~direction,data=mygenes,fun="enrichGO",OrgDb="org.Hs.eg.db",ont="BP",
+                      pvalueCutoff = 0.05,universe=tt$ENTREZID,readable=T)
+
+data.frame(my_GO) %>% group_by(direction) %>% slice_head(n=20) %>% mutate(log10FDR=ifelse(direction=='down',-(-log10(p.adjust)),-log10(p.adjust))) %>% arrange(direction,-p.adjust) %>% mutate(Description=factor(Description,levels=unique(Description))) %>% ggplot(aes(x=direction,y=Description,color=log10FDR, size = Count)) + 
+  geom_point() + facet_wrap(~direction,scale='free_x') + scale_color_gradient2(low='dodgerblue4',mid='#D7EDFF',high="#FF0A04") + labs(colour = "-log10(FDR)")
+
+# KEGG 
+my_kegg<-compareCluster(ENTREZID~direction,data=mygenes,fun="enrichKEGG",organism="hsa",
+                        pvalueCutoff = 0.05,universe=tt$ENTREZID)
+
+data.frame(my_kegg) %>% group_by(direction) %>% slice_head(n=20) %>% mutate(log10FDR=ifelse(direction=='down',-(-log10(p.adjust)),-log10(p.adjust))) %>% arrange(direction,-p.adjust) %>% mutate(Description=factor(Description,levels=unique(Description))) %>% ggplot(aes(x=direction,y=Description,color=log10FDR, size = Count)) + 
+  geom_point() + facet_wrap(~direction,scale='free_x') + scale_color_gradient2(low='dodgerblue4',mid="#D7EDFF",high="#FF0A04") + labs(colour = "-log10(FDR)")
+
+#Reactome 
+my_react <-compareCluster(ENTREZID~direction,data=mygenes,fun = "enrichPathway",
+                          pvalueCutoff = 0.05, universe=tt,readable=T)
+
+data.frame(my_react) %>% group_by(direction) %>% slice_head(n=20) %>% mutate(log10FDR=ifelse(direction=='down',-(-log10(p.adjust)),-log10(p.adjust))) %>% arrange(direction,-p.adjust) %>% mutate(Description=factor(Description,levels=unique(Description))) %>% ggplot(aes(x=direction,y=Description,color=log10FDR, size = Count)) + 
+  geom_point() + facet_wrap(~direction,scale='free_x') + scale_color_gradient2(low='dodgerblue4',mid="#D7EDFF",high="#FF0A04") + labs(colour = "-log10(FDR)")
